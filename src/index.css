@@ -1,0 +1,119 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-heading-primary {
+  font-family: 'Poppins', sans-serif;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+}
+
+.font-heading-secondary {
+  font-family: 'Inter', sans-serif;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Wood texture background - using grayscale for wooden feel */
+.wood-background {
+  background: 
+    /* Wood grain vertical lines */
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 1px,
+      rgba(0, 0, 0, 0.08) 1px,
+      rgba(0, 0, 0, 0.08) 2px,
+      transparent 2px,
+      transparent 3px,
+      rgba(0, 0, 0, 0.05) 3px,
+      rgba(0, 0, 0, 0.05) 4px
+    ),
+    /* Wood grain horizontal variation */
+    repeating-linear-gradient(
+      90deg,
+      transparent,
+      transparent 20px,
+      rgba(0, 0, 0, 0.03) 20px,
+      rgba(0, 0, 0, 0.03) 21px,
+      transparent 21px,
+      transparent 40px,
+      rgba(0, 0, 0, 0.02) 40px,
+      rgba(0, 0, 0, 0.02) 41px
+    ),
+    /* Subtle wood pattern overlay */
+    linear-gradient(
+      90deg,
+      rgba(0, 0, 0, 0.02) 0%,
+      transparent 25%,
+      transparent 75%,
+      rgba(0, 0, 0, 0.02) 100%
+    );
+  background-color: #1a1a1a;
+  background-size: 100% 100%, 100% 100%, 100% 100%;
+}
+
+.wood-panel {
+  background: 
+    /* Vertical wood grain */
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 0.5px,
+      rgba(0, 0, 0, 0.12) 0.5px,
+      rgba(0, 0, 0, 0.12) 1px,
+      transparent 1px,
+      transparent 1.5px,
+      rgba(0, 0, 0, 0.08) 1.5px,
+      rgba(0, 0, 0, 0.08) 2px
+    ),
+    /* Horizontal wood grain variation */
+    repeating-linear-gradient(
+      90deg,
+      transparent,
+      transparent 15px,
+      rgba(0, 0, 0, 0.06) 15px,
+      rgba(0, 0, 0, 0.06) 16px,
+      transparent 16px,
+      transparent 30px,
+      rgba(0, 0, 0, 0.04) 30px,
+      rgba(0, 0, 0, 0.04) 31px
+    ),
+    /* Subtle gradient for depth */
+    linear-gradient(
+      135deg,
+      rgba(0, 0, 0, 0.1) 0%,
+      transparent 50%,
+      rgba(0, 0, 0, 0.05) 100%
+    );
+  background-color: #2a2a2a;
+  position: relative;
+}
+
+.wood-panel::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: 
+    /* Additional wood texture detail */
+    repeating-linear-gradient(
+      90deg,
+      transparent,
+      transparent 8px,
+      rgba(0, 0, 0, 0.03) 8px,
+      rgba(0, 0, 0, 0.03) 9px
+    );
+  pointer-events: none;
+  opacity: 0.6;
+}
+
