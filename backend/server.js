@@ -1,58 +1,167 @@
+import "./env.js";
 import express from "express";
 import cors from "cors";
 import mqtt from "mqtt";
 import { StateManager } from "./state.js";
+import { generateCommentary } from "./commentary.js";
+import { generateSpeech, AUDIO_DIR } from "./ttsService.js";
 import os from "os";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
+app.use("/audio", express.static(AUDIO_DIR));
 
-// MQTT Configuration - Hardcoded for EMQX
-const MQTT_BROKER = "mqtts://g11e070b.ala.asia-southeast1.emqxsl.com:8883";
-const MQTT_USERNAME = "Pushp"; // Update if needed
-const MQTT_PASSWORD = "Pushp9029@r"; // Update if needed
-const DEVICE_ID = "1";
+const DIST_DIR = path.join(__dirname, "..", "dist");
+app.use(express.static(DIST_DIR));
 
-const STATE_TOPIC = `playarka/device/${DEVICE_ID}/state`;
-const PINS_TOPIC = `playarka/device/${DEVICE_ID}/pins`;
+// ---------------------------------------------------------------------------
+// MQTT & provisioning (from environment — copy backend/.env.example to .env)
+// ---------------------------------------------------------------------------
+const MQTT_PORT_TLS = Number(process.env.MQTT_PORT_TLS) || 8883;
+const MQTT_HOST = (process.env.MQTT_HOST || "").trim();
+const MQTT_BROKER =
+  (process.env.MQTT_BROKER || "").trim() ||
+  (MQTT_HOST ? `mqtts://${MQTT_HOST}:${MQTT_PORT_TLS}` : "");
+const MQTT_USERNAME = process.env.MQTT_USERNAME || "";
+const MQTT_PASSWORD = process.env.MQTT_PASSWORD || "";
 
-// Initialize state manager
-const stateManager = new StateManager();
+const PROVISION_TOKEN = process.env.PROVISION_TOKEN || "";
 
-// MQTT Client Options with TLS
+function requireEnv(label, value) {
+  if (typeof value === "string" && value.trim()) return;
+  console.error(
+    `\nMissing required env: ${label}\nCopy backend/.env.example to backend/.env and set values.\n`,
+  );
+  process.exit(1);
+}
+
+requireEnv("MQTT_BROKER or MQTT_HOST", MQTT_BROKER);
+requireEnv("MQTT_USERNAME", MQTT_USERNAME);
+requireEnv("MQTT_PASSWORD", MQTT_PASSWORD);
+requireEnv("PROVISION_TOKEN", PROVISION_TOKEN);
+
+// Wildcard topic — subscribe to ALL devices
+const STATE_TOPIC_WILDCARD = "playarka/device/+/state";
+
+// ---------------------------------------------------------------------------
+// Multi-device state & device registry (in-memory)
+// ---------------------------------------------------------------------------
+const stateManagers = new Map(); // deviceId -> StateManager
+const deviceRegistry = new Map(); // mac -> { deviceId, deviceName, mac, provisionedAt }
+const streakTrackers = new Map(); // deviceId -> { playerIndex: { strikes: number, spares: number } }
+let nextDeviceId = 1;
+
+function getStateManager(deviceId) {
+  if (!stateManagers.has(deviceId)) {
+    stateManagers.set(deviceId, new StateManager());
+  }
+  return stateManagers.get(deviceId);
+}
+
+function getStreakTracker(deviceId) {
+  if (!streakTrackers.has(deviceId)) {
+    streakTrackers.set(deviceId, {});
+  }
+  return streakTrackers.get(deviceId);
+}
+
+function updateStreak(deviceId, playerIndex, isStrike, isSpare) {
+  const tracker = getStreakTracker(deviceId);
+  if (!tracker[playerIndex]) tracker[playerIndex] = { strikes: 0, spares: 0 };
+
+  if (isStrike) {
+    tracker[playerIndex].strikes += 1;
+    tracker[playerIndex].spares = 0;
+  } else if (isSpare) {
+    tracker[playerIndex].spares += 1;
+    tracker[playerIndex].strikes = 0;
+  } else {
+    tracker[playerIndex].strikes = 0;
+    tracker[playerIndex].spares = 0;
+  }
+  return tracker[playerIndex];
+}
+
+function buildAllPlayersContext(scores) {
+  return (scores || []).map((s) => ({
+    name: s.name,
+    totalScore: s.totalScore || 0,
+  }));
+}
+
+/** Running totals through each frame + standings — for AI commentary vs rivals */
+function buildMatchContextString(scores) {
+  if (!scores?.length) return "";
+  const lines = [];
+  for (const s of scores) {
+    const parts = (s.frames || [])
+      .map((f, i) => {
+        if (f.cumulative == null) return null;
+        return `F${i + 1}:${f.cumulative}`;
+      })
+      .filter(Boolean);
+    lines.push(
+      `${s.name}: after each finished frame — ${parts.join(", ")} | total now ${s.totalScore}`,
+    );
+  }
+  if (scores.length > 1) {
+    const sorted = [...scores].sort((a, b) => b.totalScore - a.totalScore);
+    const last = sorted[sorted.length - 1];
+    const spread = sorted[0].totalScore - last.totalScore;
+    lines.push(
+      `Standings: leader ${sorted[0].name} ${sorted[0].totalScore}, trailing ${last.name} ${last.totalScore} (${spread} pt spread)`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function deviceTopicFor(deviceId) {
+  return `playarka/device/${deviceId}/state`;
+}
+
+/** Extract deviceId from a topic like "playarka/device/3/state" */
+function deviceIdFromTopic(topic) {
+  const m = topic.match(/^playarka\/device\/([^/]+)\/state$/);
+  return m ? m[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// MQTT Client
+// ---------------------------------------------------------------------------
 const mqttOptions = {
   clientId: `playarka_backend_${Date.now()}`,
   clean: true,
   reconnectPeriod: 5000,
   connectTimeout: 10000,
-  username: "Pushp",
-  password: "Pushp9029@r",
-  // TLS/SSL options for secure connection
-  rejectUnauthorized: false, // Set to true in production with proper certificates
+  username: MQTT_USERNAME,
+  password: MQTT_PASSWORD,
+  rejectUnauthorized: false,
 };
 
 const mqttClient = mqtt.connect(MQTT_BROKER, mqttOptions);
 
 mqttClient.on("connect", () => {
   console.log("✅ MQTT Connected to broker");
-
-  // Subscribe to state topic
-  mqttClient.subscribe(STATE_TOPIC, { qos: 1 }, (err) => {
+  mqttClient.subscribe(STATE_TOPIC_WILDCARD, { qos: 1 }, (err) => {
     if (err) {
-      console.error("❌ Failed to subscribe to state topic:", err);
+      console.error("❌ Failed to subscribe:", err);
     } else {
-      console.log(`✅ Subscribed to ${STATE_TOPIC}`);
+      console.log(`✅ Subscribed to ${STATE_TOPIC_WILDCARD}`);
     }
   });
 });
 
 mqttClient.on("error", (err) => {
   console.error("❌ MQTT Error:", err.message);
-  console.error("   Check your MQTT credentials and broker URL");
 });
 
 mqttClient.on("close", () => {
@@ -72,172 +181,185 @@ mqttClient.on("message", (topic, message) => {
   }
 });
 
-// Handle MQTT messages
+// ---------------------------------------------------------------------------
+// MQTT message handler (multi-device aware)
+// ---------------------------------------------------------------------------
 function handleMqttMessage(topic, data) {
-  if (topic === STATE_TOPIC) {
-    // Messages from ESP (and others) may use a "type" field instead of "action"
-    // Handle SCORE / HEARTBEAT first so they don't fall into the action switch.
-    if (data.type === "SCORE") {
-      handleScoreFromEsp(data);
-      return;
-    }
-    if (data.type === "HEARTBEAT") {
-      // For now we just log heartbeat; can be extended to track device health
-      console.log("💓 HEARTBEAT from device:", JSON.stringify(data, null, 2));
-      return;
-    }
+  const deviceId = deviceIdFromTopic(topic);
+  if (!deviceId) return;
 
-    // Ignore 'update' actions - these are state updates we publish ourselves
-    if (data.action === "update") {
-      return;
-    }
-
-    console.log(
-      `📥 Received MQTT message on ${topic}:`,
-      JSON.stringify(data, null, 2),
-    );
-    console.log(`   Action: "${data.action}"`);
-
-    switch (data.action) {
-      case "scan":
-        handleScan();
-        break;
-      case "addPlayer":
-        handleAddPlayer(data.name);
-        break;
-      case "ready":
-        handleReady();
-        break;
-      case "requestPayment":
-        handleRequestPayment(data.amount);
-        break;
-      case "paymentStatus":
-        console.log(
-          `💳 Processing paymentStatus action with status: ${data.status}`,
-        );
-        if (data.status) {
-          handlePaymentStatus(data.status);
-        } else {
-          console.error("❌ paymentStatus action missing status field");
-        }
-        break;
-      case "reset":
-        handleReset();
-        break;
-      default:
-        console.log(`⚠️  Unknown action: "${data.action}"`);
-        console.log(`   Full data:`, JSON.stringify(data, null, 2));
-    }
-  }
-}
-
-// QR Scan Handler
-function handleScan() {
-  console.log("📱 QR Code scanned");
-  stateManager.setState({ status: "onboarding" });
-  publishState();
-}
-
-// Add Player Handler
-function handleAddPlayer(name) {
-  console.log(`➕ Adding player: ${name}`);
-  const players = stateManager.getPlayers();
-  if (players.length >= 6) {
-    console.log("❌ Maximum 6 players allowed");
+  if (data.type === "SCORE") {
+    handleScoreFromEsp(deviceId, data);
     return;
   }
-  stateManager.addPlayer(name);
-  publishState();
+  if (data.type === "HEARTBEAT") {
+    console.log(`💓 HEARTBEAT device=${deviceId}:`, JSON.stringify(data));
+    return;
+  }
+  if (data.type === "PIN_ERROR") {
+    handlePinError(deviceId, data);
+    return;
+  }
+  if (data.action === "pinError") return; // skip our own re-published message
+  if (data.action === "update") return;
+
+  console.log(
+    `📥 [device=${deviceId}] action="${data.action}"`,
+    JSON.stringify(data),
+  );
+
+  switch (data.action) {
+    case "scan":
+      handleScan(deviceId);
+      break;
+    case "addPlayer":
+      handleAddPlayer(deviceId, data.name);
+      break;
+    case "ready":
+      handleReady(deviceId);
+      break;
+    case "requestPayment":
+      handleRequestPayment(deviceId, data.amount);
+      break;
+    case "paymentStatus":
+      if (data.status) {
+        handlePaymentStatus(deviceId, data.status);
+      }
+      break;
+    case "reset":
+      handleReset(deviceId);
+      break;
+    default:
+      console.log(`⚠️  Unknown action "${data.action}" on device=${deviceId}`);
+  }
 }
 
-// Ready Handler
-function handleReady() {
-  console.log("✅ Players ready for payment");
-  stateManager.setState({ ready: true, status: "payment" });
-  publishState();
+// ---------------------------------------------------------------------------
+// Action handlers (all device-aware)
+// ---------------------------------------------------------------------------
+function handleScan(deviceId) {
+  console.log(`📱 [device=${deviceId}] QR scanned`);
+  const sm = getStateManager(deviceId);
+  sm.setState({ status: "onboarding" });
+  publishState(deviceId);
 }
 
-// Request Payment Handler
-async function handleRequestPayment(amount) {
-  console.log(`💳 Payment requested: ₹${amount}`);
+function handleAddPlayer(deviceId, name) {
+  console.log(`➕ [device=${deviceId}] Adding player: ${name}`);
+  const sm = getStateManager(deviceId);
+  if (sm.getPlayers().length >= 6) return;
+  sm.addPlayer(name);
+  publishState(deviceId);
+}
 
-  // Generate payment QR (mock - replace with actual payment gateway)
-  const paymentQr = generatePaymentQr(amount);
+function handleReady(deviceId) {
+  console.log(`✅ [device=${deviceId}] Players ready`);
+  const sm = getStateManager(deviceId);
+  sm.setState({ ready: true, status: "payment" });
+  publishState(deviceId);
+}
 
-  stateManager.setState({
+async function handleRequestPayment(deviceId, amount) {
+  console.log(`💳 [device=${deviceId}] Payment requested: ₹${amount}`);
+  const paymentQr = `upi://pay?pa=merchant@upi&pn=PlayArka&am=${amount}&cu=INR`;
+  const sm = getStateManager(deviceId);
+  sm.setState({
     status: "payment",
-    paymentQr: paymentQr,
+    paymentQr,
     paymentStatus: "pending",
-    amount: amount,
+    amount,
   });
-
-  publishState();
-
-  // Simulate payment webhook after 5 seconds (for testing)
-  // In production, this would come from payment gateway webhook
-  setTimeout(() => {
-    // Uncomment to simulate successful payment
-    // handlePaymentStatus('success');
-  }, 5000);
+  publishState(deviceId);
 }
 
-// Generate Payment QR (Mock - replace with actual payment gateway)
-function generatePaymentQr(amount) {
-  // Mock UPI QR code
-  return `upi://pay?pa=merchant@upi&pn=PlayArka&am=${amount}&cu=INR`;
-}
-
-// Payment Status Handler (called from webhook in production)
-function handlePaymentStatus(status) {
-  console.log(`💳 Payment status: ${status}`);
-  stateManager.setState({
+function handlePaymentStatus(deviceId, status) {
+  console.log(`💳 [device=${deviceId}] Payment status: ${status}`);
+  const sm = getStateManager(deviceId);
+  sm.setState({
     paymentStatus: status,
     status: status === "success" ? "active" : "payment",
   });
-
-  // Always publish state update first
-  publishState();
-
+  publishState(deviceId);
   if (status === "success") {
-    // Start game (which will also publish state and gameStart)
-    console.log("🎮 Payment successful, starting game...");
-    startGame();
+    startGame(deviceId);
   }
 }
 
-// Reset Handler
-function handleReset() {
-  console.log("🔄 Resetting game state");
-  stateManager.reset();
-  publishState();
+function handleReset(deviceId) {
+  console.log(`🔄 [device=${deviceId}] Reset`);
+  const sm = getStateManager(deviceId);
+  sm.reset();
+  streakTrackers.delete(deviceId);
+  publishState(deviceId);
 }
 
-// Handle SCORE messages coming from ESP on the shared state topic
-function handleScoreFromEsp(data) {
+function handlePinError(deviceId, data) {
+  const pin = data.pin || 0;
+  console.log(
+    `🚨 [device=${deviceId}] PIN ERROR: Pin ${pin} stuck after 3 recovery attempts`,
+  );
+
+  const topic = deviceTopicFor(deviceId);
+  mqttClient.publish(
+    topic,
+    JSON.stringify({
+      action: "pinError",
+      pin,
+      message: `Pin ${pin} is stuck after 3 recovery attempts. Please check the lane.`,
+    }),
+    { qos: 1 },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TTS Announcement (fire-and-forget, never blocks game flow)
+// ---------------------------------------------------------------------------
+async function announceEvent(deviceId, ctx) {
   try {
-    const state = stateManager.getState();
+    const { text, mood } = await generateCommentary(ctx);
+    if (!text) return;
+    console.log(`🔊 [device=${deviceId}] TTS (${mood}): "${text}"`);
+
+    const filename = await generateSpeech(text, mood);
+    const baseUrl = `http://${getLocalIP()}:${PORT}`;
+    const audioUrl = `${baseUrl}/audio/${filename}`;
+
+    const topic = deviceTopicFor(deviceId);
+    mqttClient.publish(
+      topic,
+      JSON.stringify({ action: "announce", audioUrl, text, mood }),
+      { qos: 1 },
+    );
+    console.log(`📢 [device=${deviceId}] Audio published: ${audioUrl}`);
+  } catch (err) {
+    console.error(
+      `⚠️  [device=${deviceId}] TTS error (non-fatal):`,
+      err.message,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Score handling from ESP
+// ---------------------------------------------------------------------------
+function handleScoreFromEsp(deviceId, data) {
+  try {
+    const sm = getStateManager(deviceId);
+    const state = sm.getState();
     const players = state.players || [];
-    if (players.length === 0) {
-      console.log("⚠️ SCORE received but there are no players – ignoring");
-      return;
-    }
+    if (players.length === 0) return;
 
     const fallenPins = Array.isArray(data.fallenPins) ? data.fallenPins : [];
     const remainingPins = Array.isArray(data.remainingPins)
       ? data.remainingPins
       : [];
-
-    // 4‑pin test mode scoring:
-    // - STRIKE: all 4 pins fallen on 1st ball → +20 bonus, so 24 total.
-    // - SPARE: all pins fallen by 2nd ball → (pins in 2nd ball) + 10.
-    // - Otherwise: score equals pins fallen in that ball.
-    const TOTAL_PINS_PER_FRAME = 4;
+    const TOTAL_PINS_PER_FRAME = 8;
     const totalFallen = fallenPins.length;
 
     let currentPlayer =
       typeof state.currentPlayer === "number" ? state.currentPlayer : 0;
-    let frame = typeof state.frame === "number" ? state.frame : 1; // 1-based
-    let roll = typeof state.roll === "number" ? state.roll : 1; // 1-based (1..3 for duckpin)
+    let frame = typeof state.frame === "number" ? state.frame : 1;
+    let roll = typeof state.roll === "number" ? state.roll : 1;
 
     if (frame < 1) frame = 1;
     if (frame > 10) frame = 10;
@@ -249,7 +371,6 @@ function handleScoreFromEsp(data) {
     const scores =
       state.scores && Array.isArray(state.scores) ? state.scores.slice() : [];
 
-    // Ensure scores array is aligned with players
     while (scores.length < players.length) {
       const p = players[scores.length];
       const name = typeof p === "string" ? p : p.name;
@@ -262,7 +383,7 @@ function handleScoreFromEsp(data) {
           cumulative: null,
         })),
         totalScore: 0,
-        maxScore: 300,
+        maxScore: 280,
       });
     }
 
@@ -270,7 +391,6 @@ function handleScoreFromEsp(data) {
     const frameIndex = frame - 1;
     const frameScore = playerScore.frames[frameIndex];
 
-    // Calculate pins knocked down in THIS ball using cumulative fallen pins.
     let pinsThisRoll = 0;
     if (roll === 1) {
       pinsThisRoll = totalFallen;
@@ -283,60 +403,46 @@ function handleScoreFromEsp(data) {
       pinsThisRoll = Math.max(0, totalFallen - prev1 - prev2);
     }
 
-    // Apply STRIKE / SPARE rules
     let scoreThisRoll = pinsThisRoll;
     let isStrike = false;
     let isSpare = false;
 
     if (totalFallen >= TOTAL_PINS_PER_FRAME) {
       if (roll === 1) {
-        // Strike on first ball
         isStrike = true;
-        scoreThisRoll = 20 + TOTAL_PINS_PER_FRAME; // e.g. 24
+        scoreThisRoll = 20 + TOTAL_PINS_PER_FRAME;
       } else if (roll === 2) {
-        // Spare by second ball
         isSpare = true;
         scoreThisRoll = pinsThisRoll + 10;
       }
     }
 
-    // Store numeric score gained in this ball (UI will show this number)
-    if (roll === 1) {
-      frameScore.ball1 = scoreThisRoll;
-    } else if (roll === 2) {
-      frameScore.ball2 = scoreThisRoll;
-    } else {
-      frameScore.ball3 = scoreThisRoll;
-    }
+    if (roll === 1) frameScore.ball1 = scoreThisRoll;
+    else if (roll === 2) frameScore.ball2 = scoreThisRoll;
+    else frameScore.ball3 = scoreThisRoll;
 
-    // Update totals (very basic: just sum all numeric pins across frames)
     let total = 0;
     playerScore.frames.forEach((f) => {
-      const b1 = typeof f.ball1 === "number" ? f.ball1 : 0;
-      const b2 = typeof f.ball2 === "number" ? f.ball2 : 0;
-      const b3 = typeof f.ball3 === "number" ? f.ball3 : 0;
-      total += b1 + b2 + b3;
+      total +=
+        (typeof f.ball1 === "number" ? f.ball1 : 0) +
+        (typeof f.ball2 === "number" ? f.ball2 : 0) +
+        (typeof f.ball3 === "number" ? f.ball3 : 0);
       f.cumulative = total > 0 ? total : null;
     });
     playerScore.totalScore = total;
 
-    // Advance roll / frame / player
     let nextPlayer = currentPlayer;
     let nextFrame = frame;
     let nextRoll = roll + 1;
 
-    // On STRIKE or SPARE, frame ends immediately and player changes
     if (isStrike || isSpare) {
       nextRoll = 1;
       if (nextPlayer < players.length - 1) {
         nextPlayer += 1;
       } else {
         nextPlayer = 0;
-        if (nextFrame < 10) {
-          nextFrame += 1;
-        } else {
-          state.status = "completed";
-        }
+        if (nextFrame < 10) nextFrame += 1;
+        else state.status = "completed";
       }
     } else if (nextRoll > 3) {
       nextRoll = 1;
@@ -344,12 +450,8 @@ function handleScoreFromEsp(data) {
         nextPlayer += 1;
       } else {
         nextPlayer = 0;
-        if (nextFrame < 10) {
-          nextFrame += 1;
-        } else {
-          // Last ball of last frame for last player – mark game completed
-          state.status = "completed";
-        }
+        if (nextFrame < 10) nextFrame += 1;
+        else state.status = "completed";
       }
     }
 
@@ -358,27 +460,76 @@ function handleScoreFromEsp(data) {
     state.roll = nextRoll;
     state.scores = scores;
 
-    stateManager.setState(state);
-    publishState();
+    const prevPlayer = currentPlayer;
+    state.currentPlayer = nextPlayer;
+    state.frame = nextFrame;
+    state.roll = nextRoll;
+    state.scores = scores;
 
-    // Also publish a lightweight gameState message for ESP / hardware
-    const gameStateMessage = {
-      action: "gameState",
-      currentPlayer: state.currentPlayer,
-      frame: state.frame,
-      roll: state.roll,
-    };
+    sm.setState(state);
+    publishState(deviceId);
 
-    mqttClient.publish(STATE_TOPIC, JSON.stringify(gameStateMessage), {
-      qos: 1,
-      // Use retain: true temporarily so it's easy to see in EMQX
-      // You can switch this back to false once you've verified it works.
-      retain: true,
+    // --- TTS announcements (fire-and-forget, never blocks) ---
+    const playerName =
+      typeof players[prevPlayer] === "string"
+        ? players[prevPlayer]
+        : players[prevPlayer]?.name || "Bowler";
+
+    const streakInfo = updateStreak(deviceId, prevPlayer, isStrike, isSpare);
+    const allPlayers = buildAllPlayersContext(scores);
+    const matchContext = buildMatchContextString(scores);
+
+    announceEvent(deviceId, {
+      event: "score",
+      player: playerName,
+      pins: pinsThisRoll,
+      isStrike,
+      isSpare,
+      frame,
+      roll,
+      streak: streakInfo.strikes,
+      spareStreak: streakInfo.spares,
+      allPlayers,
+      matchContext,
+    }).then(() => {
+      if (nextPlayer !== prevPlayer && state.status !== "completed") {
+        const nextName =
+          typeof players[nextPlayer] === "string"
+            ? players[nextPlayer]
+            : players[nextPlayer]?.name || "Bowler";
+        return announceEvent(deviceId, {
+          event: "nextPlayer",
+          player: nextName,
+          frame: nextFrame,
+          allPlayers,
+          matchContext,
+        });
+      }
     });
 
-    console.log("📤 gameState published:", gameStateMessage);
+    if (state.status === "completed") {
+      const topic = deviceTopicFor(deviceId);
+      mqttClient.publish(topic, JSON.stringify({ action: "gameOver" }), {
+        qos: 1,
+        retain: true,
+      });
+      console.log(`📤 [device=${deviceId}] gameOver published`);
 
-    console.log("🎳 SCORE processed from ESP:", {
+      const winner = scores.reduce(
+        (best, s) => (s.totalScore > best.totalScore ? s : best),
+        scores[0],
+      );
+      announceEvent(deviceId, {
+        event: "gameOver",
+        player: winner.name,
+        score: winner.totalScore,
+        allPlayers: buildAllPlayersContext(scores),
+        matchContext: buildMatchContextString(scores),
+      });
+      streakTrackers.delete(deviceId);
+    }
+
+    console.log(`🎳 [device=${deviceId}] SCORE processed`, {
       player: nextPlayer,
       frame: nextFrame,
       roll: nextRoll,
@@ -387,15 +538,17 @@ function handleScoreFromEsp(data) {
       remainingPins,
     });
   } catch (err) {
-    console.error("❌ Error handling SCORE from ESP:", err);
+    console.error(`❌ [device=${deviceId}] Error handling SCORE:`, err);
   }
 }
 
+// ---------------------------------------------------------------------------
 // Start Game
-function startGame() {
-  console.log("🎮 Starting game");
-  const players = stateManager.getPlayers();
-  // Initialize simple score structures for each player
+// ---------------------------------------------------------------------------
+function startGame(deviceId) {
+  console.log(`🎮 [device=${deviceId}] Starting game`);
+  const sm = getStateManager(deviceId);
+  const players = sm.getPlayers();
   const scores = players.map((p) => {
     const name = typeof p === "string" ? p : p.name;
     return {
@@ -407,11 +560,11 @@ function startGame() {
         cumulative: null,
       })),
       totalScore: 0,
-      maxScore: 300,
+      maxScore: 280,
     };
   });
 
-  stateManager.setState({
+  sm.setState({
     status: "active",
     gameStarted: true,
     currentPlayer: 0,
@@ -420,130 +573,198 @@ function startGame() {
     scores,
   });
 
-  publishState();
+  publishState(deviceId);
 
-  // Publish game start
-  // Lightweight gameStart message for ESP / hardware (frontend already
-  // knows players from the published state)
-  const gameStartMessage = {
-    action: "gameStart",
-  };
-
-  mqttClient.publish(STATE_TOPIC, JSON.stringify(gameStartMessage), {
+  const topic = deviceTopicFor(deviceId);
+  mqttClient.publish(topic, JSON.stringify({ action: "gameStart" }), {
     qos: 1,
     retain: true,
   });
+
+  streakTrackers.delete(deviceId);
+
+  const firstPlayer =
+    typeof players[0] === "string" ? players[0] : players[0]?.name || "Bowler";
+  const allPlayers = players.map((p) => ({
+    name: typeof p === "string" ? p : p.name,
+    totalScore: 0,
+  }));
+  announceEvent(deviceId, {
+    event: "gameStart",
+    player: firstPlayer,
+    allPlayers,
+  });
 }
 
-// Publish current state
-function publishState() {
-  const state = stateManager.getState();
-  // Transform players from objects to strings for frontend compatibility
+// ---------------------------------------------------------------------------
+// Publish state for a specific device
+// ---------------------------------------------------------------------------
+function publishState(deviceId) {
+  const sm = getStateManager(deviceId);
+  const state = sm.getState();
   const players = state.players.map((p) =>
     typeof p === "string" ? p : p.name,
   );
 
-  const message = {
-    action: "update",
-    ...state,
-    players: players,
-  };
+  const message = { action: "update", ...state, players };
+  const topic = deviceTopicFor(deviceId);
 
-  mqttClient.publish(STATE_TOPIC, JSON.stringify(message), {
-    qos: 1,
-    retain: true,
-  });
-
-  console.log("📤 State published:", message);
+  mqttClient.publish(topic, JSON.stringify(message), { qos: 1, retain: true });
+  console.log(`📤 [device=${deviceId}] State published`);
 }
 
-// Get local IP address for network access
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name]) {
-      // Skip internal (loopback) and non-IPv4 addresses
-      if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address;
-      }
+      if (iface.family === "IPv4" && !iface.internal) return iface.address;
     }
   }
   return "localhost";
 }
 
-// API Routes
+// ---------------------------------------------------------------------------
+// REST API — Device provisioning
+// ---------------------------------------------------------------------------
+app.post("/api/device/provision", (req, res) => {
+  const { token, deviceName, mac } = req.body;
 
-// Get server info (IP address for mobile connection)
+  if (!token || !deviceName || !mac) {
+    return res
+      .status(400)
+      .json({ error: "token, deviceName, and mac are required" });
+  }
+
+  if (token !== PROVISION_TOKEN) {
+    console.log(`🚫 Provision rejected — invalid token from ${mac}`);
+    return res.status(401).json({ error: "Invalid provisioning token" });
+  }
+
+  // Idempotent: same MAC always gets same deviceId
+  if (deviceRegistry.has(mac)) {
+    const existing = deviceRegistry.get(mac);
+    console.log(`✅ Re-provision for MAC ${mac} → device=${existing.deviceId}`);
+    return res.json({
+      status: "ok",
+      deviceId: existing.deviceId,
+      mqttHost: MQTT_HOST,
+      mqttPort: MQTT_PORT_TLS,
+      mqttUsername: MQTT_USERNAME,
+      mqttPassword: MQTT_PASSWORD,
+    });
+  }
+
+  const deviceId = String(nextDeviceId++);
+  deviceRegistry.set(mac, {
+    deviceId,
+    deviceName,
+    mac,
+    provisionedAt: new Date().toISOString(),
+  });
+
+  // Pre-create a state manager so it's ready when the device connects
+  getStateManager(deviceId);
+
+  console.log(`🆕 Provisioned ${deviceName} (${mac}) → device=${deviceId}`);
+  return res.json({
+    status: "ok",
+    deviceId,
+    mqttHost: MQTT_HOST,
+    mqttPort: MQTT_PORT_TLS,
+    mqttUsername: MQTT_USERNAME,
+    mqttPassword: MQTT_PASSWORD,
+  });
+});
+
+// List all provisioned devices
+app.get("/api/devices", (_req, res) => {
+  const devices = [];
+  for (const [mac, info] of deviceRegistry) {
+    devices.push({ ...info, mac });
+  }
+  res.json(devices);
+});
+
+// ---------------------------------------------------------------------------
+// REST API — Existing endpoints (device-aware via ?device= query param)
+// ---------------------------------------------------------------------------
 app.get("/api/info", (req, res) => {
   const localIP = getLocalIP();
   res.json({
     local: `http://localhost:${PORT}`,
     network: `http://${localIP}:${PORT}`,
     mqttBroker: MQTT_BROKER,
-    deviceId: DEVICE_ID,
   });
 });
 
-// Get current state
 app.get("/api/state", (req, res) => {
-  res.json(stateManager.getState());
+  const deviceId = req.query.device || "1";
+  res.json(getStateManager(deviceId).getState());
 });
 
-// Add player (HTTP endpoint - alternative to MQTT)
 app.post("/api/players", (req, res) => {
   const { name } = req.body;
-  if (!name) {
-    return res.status(400).json({ error: "Name is required" });
-  }
-
-  handleAddPlayer(name);
-  res.json({ success: true, players: stateManager.getPlayers() });
+  const deviceId = req.query.device || req.body.device || "1";
+  if (!name) return res.status(400).json({ error: "Name is required" });
+  handleAddPlayer(deviceId, name);
+  res.json({ success: true, players: getStateManager(deviceId).getPlayers() });
 });
 
-// Remove player
 app.delete("/api/players/:index", (req, res) => {
+  const deviceId = req.query.device || "1";
   const index = parseInt(req.params.index);
-  stateManager.removePlayer(index);
-  publishState();
-  res.json({ success: true, players: stateManager.getPlayers() });
+  const sm = getStateManager(deviceId);
+  sm.removePlayer(index);
+  publishState(deviceId);
+  res.json({ success: true, players: sm.getPlayers() });
 });
 
-// Request payment (HTTP endpoint)
 app.post("/api/payment/request", (req, res) => {
   const { amount } = req.body;
-  if (!amount) {
-    return res.status(400).json({ error: "Amount is required" });
-  }
-
-  handleRequestPayment(amount);
+  const deviceId = req.query.device || req.body.device || "1";
+  if (!amount) return res.status(400).json({ error: "Amount is required" });
+  handleRequestPayment(deviceId, amount);
   res.json({ success: true });
 });
 
-// Payment webhook (for payment gateway to call)
 app.post("/api/payment/webhook", (req, res) => {
   const { status, paymentId } = req.body;
-
-  // Verify payment webhook (add signature verification in production)
-  console.log(`📥 Payment webhook received: ${status} for ${paymentId}`);
-
-  handlePaymentStatus(status);
+  const deviceId = req.query.device || req.body.device || "1";
+  console.log(`📥 Payment webhook: ${status} for ${paymentId}`);
+  handlePaymentStatus(deviceId, status);
   res.json({ success: true });
 });
 
-// Reset state (for testing)
 app.post("/api/reset", (req, res) => {
-  stateManager.reset();
-  publishState();
+  const deviceId = req.query.device || req.body.device || "1";
+  const sm = getStateManager(deviceId);
+  sm.reset();
+  publishState(deviceId);
   res.json({ success: true, message: "State reset" });
 });
 
-// Start server - bind to 0.0.0.0 to allow network access
+// SPA fallback — serve index.html for any non-API route (React Router)
+app.get("*", (_req, res) => {
+  const indexPath = path.join(DIST_DIR, "index.html");
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(404).send("Frontend not built. Run: npm run build");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
 const localIP = getLocalIP();
 app.listen(PORT, "0.0.0.0", () => {
   console.log("\n🚀 Backend server running!");
   console.log(`📍 Local:   http://localhost:${PORT}`);
   console.log(`🌐 Network: http://${localIP}:${PORT}`);
-  console.log(`\n📡 MQTT Broker: ${MQTT_BROKER}`);
-  console.log(`🎯 Device ID: ${DEVICE_ID}`);
-  console.log(`\n💡 Use the Network URL on your mobile device (same WiFi)\n`);
+  console.log(`📡 MQTT:    ${MQTT_BROKER} (wildcard: ${STATE_TOPIC_WILDCARD})`);
+  console.log(`🔑 Provision token: ${PROVISION_TOKEN}`);
+  console.log(`\n💡 Devices provision via POST /api/device/provision\n`);
 });

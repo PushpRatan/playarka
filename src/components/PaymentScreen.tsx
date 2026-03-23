@@ -5,11 +5,15 @@ interface PaymentScreenProps {
   onSimulatePayment?: () => void;
 }
 
-export function PaymentScreen({ paymentQr, amount, paymentStatus, onSimulatePayment }: PaymentScreenProps) {
+export function PaymentScreen({
+  paymentQr,
+  amount,
+  paymentStatus,
+  onSimulatePayment,
+}: PaymentScreenProps) {
   const handleQrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (onSimulatePayment && paymentStatus !== 'success') {
-      console.log('💳 Simulating payment...');
+    if (onSimulatePayment && paymentStatus !== "success") {
       onSimulatePayment();
     }
   };
@@ -21,7 +25,7 @@ export function PaymentScreen({ paymentQr, amount, paymentStatus, onSimulatePaym
           Payment Required
         </h2>
 
-        {paymentStatus === 'success' ? (
+        {paymentStatus === "success" ? (
           <div className="wood-panel border-2 border-green-500/50 rounded-lg p-6 text-center relative overflow-hidden">
             <div className="text-4xl mb-4">✅</div>
             <p className="text-lg font-semibold text-green-400">
@@ -36,9 +40,7 @@ export function PaymentScreen({ paymentQr, amount, paymentStatus, onSimulatePaym
             {amount && (
               <div className="wood-panel border-2 border-gray-600/40 rounded-lg p-4 mb-6 text-center relative overflow-hidden">
                 <p className="text-sm text-gray-400">Amount to Pay</p>
-                <p className="text-3xl font-bold text-white mt-2">
-                  ₹{amount}
-                </p>
+                <p className="text-3xl font-bold text-white mt-2">₹{amount}</p>
               </div>
             )}
 
@@ -47,7 +49,7 @@ export function PaymentScreen({ paymentQr, amount, paymentStatus, onSimulatePaym
                 Click the QR code to simulate payment
               </p>
               <div className="flex justify-center">
-                <div 
+                <div
                   onClick={handleQrClick}
                   className="w-64 h-64 bg-black/40 border-2 border-gray-600/40 rounded flex items-center justify-center cursor-pointer hover:bg-black/50 transition-colors"
                   title="Click to simulate payment"
@@ -59,7 +61,7 @@ export function PaymentScreen({ paymentQr, amount, paymentStatus, onSimulatePaym
               </div>
             </div>
 
-            {paymentStatus === 'pending' && (
+            {paymentStatus === "pending" && (
               <div className="wood-panel border-2 border-yellow-500/50 rounded-lg p-4 text-center relative overflow-hidden">
                 <p className="text-sm text-yellow-400">
                   Waiting for payment...
@@ -72,4 +74,3 @@ export function PaymentScreen({ paymentQr, amount, paymentStatus, onSimulatePaym
     </div>
   );
 }
-

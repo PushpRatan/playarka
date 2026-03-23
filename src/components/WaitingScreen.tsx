@@ -10,12 +10,12 @@ export function WaitingScreen({ players, status }: WaitingScreenProps) {
         <h2 className="text-3xl font-bold text-white mb-8 text-center">
           Waiting for Players
         </h2>
-        
+
         <div className="wood-panel border-2 border-gray-600/40 rounded-lg p-6 mb-6 relative overflow-hidden">
           <h3 className="text-lg font-semibold text-gray-300 mb-4">
             Players Joined ({players.length})
           </h3>
-          
+
           {players.length === 0 ? (
             <p className="text-gray-400 text-center py-4">
               No players yet. Scan the QR code to join!
@@ -45,4 +45,3 @@ export function WaitingScreen({ players, status }: WaitingScreenProps) {
     </div>
   );
 }
-

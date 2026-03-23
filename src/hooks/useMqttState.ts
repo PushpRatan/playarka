@@ -4,10 +4,20 @@ import mqtt, { type MqttClient } from "mqtt";
 const MQTT_BROKER = "wss://g11e070b.ala.asia-southeast1.emqxsl.com:8084/mqtt";
 const MQTT_USERNAME = "Pushp";
 const MQTT_PASSWORD = "Pushp9029@r";
-const DEVICE_ID = "1";
-const STATE_TOPIC = `playarka/device/${DEVICE_ID}/state`;
+
+/** Device/lane id from URL (?device=1) or default "1" for single-lane. */
+function getDeviceIdFromUrl(): string {
+  return new URLSearchParams(window.location.search).get("device") || "1";
+}
 
 type Player = string | { id: string; name: string; index: number };
+
+interface Announcement {
+  audioUrl: string;
+  text: string;
+  mood: string;
+  timestamp: number;
+}
 
 interface GameState {
   status: "waiting" | "onboarding" | "payment" | "active" | "completed";
@@ -20,11 +30,15 @@ interface GameState {
   currentPlayer: number;
   frame: number;
   roll: number;
-  // Optional scores structure coming from backend, one per player
   scores?: any;
+  announce: Announcement | null;
+  pinError: { pin: number; message: string } | null;
 }
 
 export function useMqttState() {
+  const deviceId = getDeviceIdFromUrl();
+  const stateTopic = `playarka/device/${deviceId}/state`;
+
   const [state, setState] = useState<GameState>({
     status: "waiting",
     players: [],
@@ -37,6 +51,8 @@ export function useMqttState() {
     frame: 1,
     roll: 1,
     scores: [],
+    announce: null,
+    pinError: null,
   });
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,7 +60,7 @@ export function useMqttState() {
 
   useEffect(() => {
     const options = {
-      clientId: `playarka_web_${Math.random().toString(16).substring(2, 8)}`,
+      clientId: `playarka_web_${deviceId}_${Math.random().toString(16).substring(2, 8)}`,
       clean: true,
       reconnectPeriod: 5000,
       connectTimeout: 10000,
@@ -60,13 +76,13 @@ export function useMqttState() {
       setIsConnected(true);
       setError(null);
 
-      // Subscribe to state topic
-      client.subscribe(STATE_TOPIC, { qos: 1 }, (err) => {
+      // Subscribe to state topic for this device/lane
+      client.subscribe(stateTopic, { qos: 1 }, (err) => {
         if (err) {
           console.error("❌ Subscribe error:", err);
           setError("Failed to subscribe");
         } else {
-          console.log(`✅ Subscribed to ${STATE_TOPIC}`);
+          console.log(`✅ Subscribed to ${stateTopic}`);
         }
       });
     });
@@ -91,7 +107,7 @@ export function useMqttState() {
         const data = JSON.parse(message.toString());
         console.log(`📥 Frontend received MQTT message:`, data);
 
-        if (topic === STATE_TOPIC) {
+        if (topic === stateTopic) {
           if (data.action === "update") {
             console.log(`🔄 Processing update action, status: ${data.status}`);
             // Ensure players are always strings (backend should send strings, but handle objects just in case)
@@ -100,9 +116,10 @@ export function useMqttState() {
             });
 
             setState((prev) => {
+              const status = data.status || "waiting";
               const newState: GameState = {
                 ...prev,
-                status: data.status || "waiting",
+                status,
                 players: players,
                 ready: data.ready || false,
                 paymentQr: data.paymentQr || null,
@@ -113,6 +130,7 @@ export function useMqttState() {
                 frame: data.frame ?? prev.frame,
                 roll: data.roll ?? prev.roll,
                 scores: data.scores ?? prev.scores,
+                pinError: (status === "waiting" || status === "active") ? null : prev.pinError,
               };
 
               console.log(`✅ Updating state to:`, newState);
@@ -142,6 +160,24 @@ export function useMqttState() {
               frame: data.frame || prev.frame,
               roll: data.roll || prev.roll,
             }));
+          } else if (data.action === "announce") {
+            setState((prev) => ({
+              ...prev,
+              announce: {
+                audioUrl: data.audioUrl,
+                text: data.text || "",
+                mood: data.mood || "medium",
+                timestamp: Date.now(),
+              },
+            }));
+          } else if (data.action === "pinError") {
+            setState((prev) => ({
+              ...prev,
+              pinError: {
+                pin: data.pin,
+                message: data.message || `Pin ${data.pin} is stuck`,
+              },
+            }));
           } else {
             console.log(`⚠️  Unhandled action: ${data.action}`);
           }
@@ -157,12 +193,12 @@ export function useMqttState() {
         mqttClientRef.current = null;
       }
     };
-  }, []);
+  }, [deviceId, stateTopic]);
 
   const publish = (action: string, data: any = {}) => {
     if (mqttClientRef.current && mqttClientRef.current.connected) {
       const message = JSON.stringify({ action, ...data });
-      mqttClientRef.current.publish(STATE_TOPIC, message, { qos: 1 }, (err) => {
+      mqttClientRef.current.publish(stateTopic, message, { qos: 1 }, (err) => {
         if (err) {
           console.error("❌ Publish error:", err);
         }
@@ -173,6 +209,7 @@ export function useMqttState() {
   };
 
   return {
+    deviceId,
     state,
     isConnected,
     error,

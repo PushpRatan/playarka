@@ -1,4 +1,4 @@
-// RS485 Master with Ball Sensor State Machine
+// RS485 Master with Ball Sensor State Machine + I2C FRAM Config Storage
 // Board: generic Arduino-compatible MCU acting as RS485 master
 //
 // Behavior:
@@ -6,10 +6,20 @@
 // - In STATE_FREE, motor is commanded "free" and outputs stay stable
 //   until ball sensor detects a ball (sensor goes from 1 -> 0).
 // - Once ball is detected, wait 2 seconds, then transition to STATE_FORWARD.
+//
+// FRAM (FM24CL64B @ 0x50):
+// - Stores device provisioning config (WiFi creds, MQTT creds, deviceId)
+// - ESP32-S3 reads/writes config via Serial commands:
+//     {"cmd":"configRead"}  -> RP reads FRAM, responds with config JSON
+//     {"cmd":"configWrite",...} -> RP writes to FRAM, responds with ack
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <SoftwareSerial.h>
+#include <Wire.h>
+#include <string.h>
+
+// ===================== Pin Definitions =====================
 
 // RS485 bus (to slaves)
 #define RS485_TX_PIN 0
@@ -19,52 +29,74 @@
 
 #define BAUDRATE 9600
 
-// Ball sensor pin:
-// Assumption: sensor outputs 1 when NO ball is present, 0 when ball IS present.
-// Change this pin number and pinMode configuration in setup() if your wiring differs.
+// Encoder revolutions for the DOWN leg of the rack cycle (sent to slaves; tune here only)
+#define MOTOR_DOWN_REVS 8
+
+// Ball sensor: 1 = no ball, 0 = ball present
 #define BALL_SENSOR_PIN 13
 
 // ESP32 link (to PlayArka master ESP32-S3)
-// Match the wiring used in your simple RP<->ESP test:
 // RP TX 20 -> ESP RX 44
 // RP RX 21 -> ESP TX 43
 #define ESP_RX_PIN 21
 #define ESP_TX_PIN 20
 #define ESP_BAUD   115200
 
+// I2C FRAM (FM24CL64B-G)
+// RP2040: SDA=GP4, SCL=GP5 | AVR Uno/Nano: SDA=A4, SCL=A5
+// Adjust if your wiring differs.
+#define FRAM_I2C_ADDR 0x50
+#define I2C_SDA_PIN 16
+#define I2C_SCL_PIN 17
+#define FRAM_WP_PIN   18    // Write Protect pin — driven LOW to allow writes
+
+// ===================== FRAM Config Layout =====================
+// Total: ~379 bytes — well within FM24CL64B's 8 KB
+#define FRAM_MAGIC_OFFSET   0x0000  // 2 bytes: 'P','A'
+#define FRAM_CONFIG_OFFSET  0x0002  // 1 byte: configured flag (0/1)
+#define FRAM_SSID_OFFSET    0x0003  // 1 byte len + 32 bytes
+#define FRAM_SSID_MAX       32
+#define FRAM_WPASS_OFFSET   0x0024  // 1 byte len + 64 bytes
+#define FRAM_WPASS_MAX      64
+#define FRAM_MQHOST_OFFSET  0x0065  // 1 byte len + 128 bytes
+#define FRAM_MQHOST_MAX     128
+#define FRAM_MQPORT_OFFSET  0x00E6  // 2 bytes big-endian uint16
+#define FRAM_MQUSER_OFFSET  0x00E8  // 1 byte len + 64 bytes
+#define FRAM_MQUSER_MAX     64
+#define FRAM_MQPASS_OFFSET  0x0129  // 1 byte len + 64 bytes
+#define FRAM_MQPASS_MAX     64
+#define FRAM_DEVID_OFFSET   0x016A  // 1 byte len + 16 bytes
+#define FRAM_DEVID_MAX      16
+
+// ===================== Software Serials =====================
+
 SoftwareSerial RS485(RS485_RX_PIN, RS485_TX_PIN);
 SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
 
-// Variables for logic
-int statusCount = 0;
-bool slaveReplied[4] = {false}; // Track unique replies
+// ===================== Pin Tracking =====================
 
-// Serial buffer for ESP communication
+const int TOTAL_PINS = 8;
+
+int statusCount = 0;
+bool slaveReplied[TOTAL_PINS] = {false};
+
 static const size_t SERIAL_LINE_MAX = 512;
 static char espSerialLine[SERIAL_LINE_MAX];
 static size_t espSerialLineLen = 0;
 
-// Pin tracking: 4 pins total; all 4 (0–3) come from real slaves
-// For testing, a STRIKE means all 4 pins have fallen.
-const int TOTAL_PINS = 4;
-// true -> standing, false -> fallen; for real pins (0–3) this is latched:
-// once a pin becomes false, it stays false.
 bool pinStates[TOTAL_PINS];
 int remainingPins[TOTAL_PINS];
 int fallenPins[TOTAL_PINS];
 int remainingCount = 0;
 int fallenCount = 0;
 
-// Flag to indicate that a ball was just detected and we should send pins to ESP
+int ballsSinceLastFullRack = 0;
 bool ballJustDetected = false;
-
-// Flag to cancel any in-progress ball-wait when a new game / reset command arrives
 bool cancelBallWait = false;
-
-// TIMER VARIABLES
-unsigned long waitStartTime = 0;
-bool waitingToSendStatus = false; // Flag to track if we are in the "gap"
-const long interval = 3000;       // 3 second delay
+bool waitingForStatus = false;
+bool gameOver = false;
+/// After gameStart: wait for one full status_req round-trip (all slaves) before first UP.
+bool pendingGameStart = false;
 
 enum MotorState {
   STATE_FORWARD,
@@ -75,7 +107,191 @@ enum MotorState {
 
 MotorState currentState = STATE_FORWARD;
 
-// ================= RS485 Functions =================
+// ===================== FRAM I2C Functions =====================
+
+bool framAvailable = false;
+
+void framWriteBytes(uint16_t startAddr, const uint8_t *data, size_t len) {
+  digitalWrite(FRAM_WP_PIN, LOW); // ensure writes are enabled
+  size_t offset = 0;
+  while (offset < len) {
+    size_t chunk = len - offset;
+    if (chunk > 28) chunk = 28; // Wire buffer safe limit (30 - 2 addr bytes)
+    Wire.beginTransmission(FRAM_I2C_ADDR);
+    Wire.write((uint8_t)((startAddr + offset) >> 8));
+    Wire.write((uint8_t)((startAddr + offset) & 0xFF));
+    Wire.write(data + offset, chunk);
+    Wire.endTransmission();
+    offset += chunk;
+  }
+}
+
+void framReadBytes(uint16_t startAddr, uint8_t *data, size_t len) {
+  size_t offset = 0;
+  while (offset < len) {
+    size_t chunk = len - offset;
+    if (chunk > 32) chunk = 32;
+    Wire.beginTransmission(FRAM_I2C_ADDR);
+    Wire.write((uint8_t)((startAddr + offset) >> 8));
+    Wire.write((uint8_t)((startAddr + offset) & 0xFF));
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)FRAM_I2C_ADDR, (uint8_t)chunk);
+    for (size_t i = 0; i < chunk && Wire.available(); i++) {
+      data[offset + i] = Wire.read();
+    }
+    offset += chunk;
+  }
+}
+
+void framWriteString(uint16_t addr, const char *str, size_t maxLen) {
+  size_t len = strlen(str);
+  if (len > maxLen) len = maxLen;
+  uint8_t lenByte = (uint8_t)len;
+  framWriteBytes(addr, &lenByte, 1);
+  if (len > 0) framWriteBytes(addr + 1, (const uint8_t *)str, len);
+}
+
+size_t framReadString(uint16_t addr, char *buf, size_t bufSize, size_t maxFieldLen) {
+  uint8_t len = 0;
+  framReadBytes(addr, &len, 1);
+  if (len > maxFieldLen) len = (uint8_t)maxFieldLen;
+  if (len >= bufSize) len = (uint8_t)(bufSize - 1);
+  if (len > 0) framReadBytes(addr + 1, (uint8_t *)buf, len);
+  buf[len] = '\0';
+  return len;
+}
+
+void framWriteUint16(uint16_t addr, uint16_t val) {
+  uint8_t buf[2] = { (uint8_t)(val >> 8), (uint8_t)(val & 0xFF) };
+  framWriteBytes(addr, buf, 2);
+}
+
+uint16_t framReadUint16(uint16_t addr) {
+  uint8_t buf[2] = {0, 0};
+  framReadBytes(addr, buf, 2);
+  return ((uint16_t)buf[0] << 8) | buf[1];
+}
+
+bool framDetect() {
+  Wire.beginTransmission(FRAM_I2C_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+bool framHasMagic() {
+  uint8_t magic[2] = {0, 0};
+  framReadBytes(FRAM_MAGIC_OFFSET, magic, 2);
+  return (magic[0] == 'P' && magic[1] == 'A');
+}
+
+void framWriteMagic() {
+  uint8_t magic[2] = {'P', 'A'};
+  framWriteBytes(FRAM_MAGIC_OFFSET, magic, 2);
+}
+
+// ===================== Config Commands (ESP <-> FRAM) =====================
+
+void handleConfigRead() {
+  JsonDocument doc;
+  doc["type"] = "config";
+
+  if (!framAvailable) {
+    doc["configured"] = 0;
+    doc["error"] = "FRAM not found";
+  } else if (!framHasMagic()) {
+    doc["configured"] = 0;
+  } else {
+    uint8_t cfgFlag = 0;
+    framReadBytes(FRAM_CONFIG_OFFSET, &cfgFlag, 1);
+    doc["configured"] = cfgFlag ? 1 : 0;
+
+    char buf[129];
+    framReadString(FRAM_SSID_OFFSET, buf, sizeof(buf), FRAM_SSID_MAX);
+    doc["ssid"] = String(buf);
+
+    framReadString(FRAM_WPASS_OFFSET, buf, sizeof(buf), FRAM_WPASS_MAX);
+    doc["pass"] = String(buf);
+
+    framReadString(FRAM_MQHOST_OFFSET, buf, sizeof(buf), FRAM_MQHOST_MAX);
+    doc["mqttHost"] = String(buf);
+
+    doc["mqttPort"] = framReadUint16(FRAM_MQPORT_OFFSET);
+
+    framReadString(FRAM_MQUSER_OFFSET, buf, sizeof(buf), FRAM_MQUSER_MAX);
+    doc["mqttUser"] = String(buf);
+
+    framReadString(FRAM_MQPASS_OFFSET, buf, sizeof(buf), FRAM_MQPASS_MAX);
+    doc["mqttPass"] = String(buf);
+
+    framReadString(FRAM_DEVID_OFFSET, buf, sizeof(buf), FRAM_DEVID_MAX);
+    doc["deviceId"] = String(buf);
+  }
+
+  serializeJson(doc, espSerial);
+  espSerial.println();
+  espSerial.flush();
+
+  Serial.print("FRAM -> ESP config: ");
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void handleConfigWrite(JsonDocument &cmdDoc) {
+  if (!framAvailable) {
+    espSerial.println("{\"type\":\"configWriteErr\",\"error\":\"FRAM not found\"}");
+    espSerial.flush();
+    return;
+  }
+
+  framWriteMagic();
+
+  uint8_t cfgFlag = cmdDoc["configured"] | 0;
+  framWriteBytes(FRAM_CONFIG_OFFSET, &cfgFlag, 1);
+
+  const char *ssid     = cmdDoc["ssid"]     | "";
+  const char *pass     = cmdDoc["pass"]     | "";
+  const char *mqttHost = cmdDoc["mqttHost"] | "";
+  uint16_t    mqttPort = cmdDoc["mqttPort"] | 8883;
+  const char *mqttUser = cmdDoc["mqttUser"] | "";
+  const char *mqttPass = cmdDoc["mqttPass"] | "";
+  const char *deviceId = cmdDoc["deviceId"] | "";
+
+  framWriteString(FRAM_SSID_OFFSET,    ssid,     FRAM_SSID_MAX);
+  framWriteString(FRAM_WPASS_OFFSET,   pass,     FRAM_WPASS_MAX);
+  framWriteString(FRAM_MQHOST_OFFSET,  mqttHost, FRAM_MQHOST_MAX);
+  framWriteUint16(FRAM_MQPORT_OFFSET,  mqttPort);
+  framWriteString(FRAM_MQUSER_OFFSET,  mqttUser, FRAM_MQUSER_MAX);
+  framWriteString(FRAM_MQPASS_OFFSET,  mqttPass, FRAM_MQPASS_MAX);
+  framWriteString(FRAM_DEVID_OFFSET,   deviceId, FRAM_DEVID_MAX);
+
+  Serial.print("FRAM write: configured=");
+  Serial.print(cfgFlag);
+  Serial.print(" ssid=");
+  Serial.print(ssid);
+  Serial.print(" deviceId=");
+  Serial.println(deviceId);
+
+  espSerial.println("{\"type\":\"configWriteOk\"}");
+  espSerial.flush();
+}
+
+void handleConfigClear() {
+  if (!framAvailable) {
+    espSerial.println("{\"type\":\"configWriteErr\",\"error\":\"FRAM not found\"}");
+    espSerial.flush();
+    return;
+  }
+
+  // Clear magic bytes and configured flag
+  uint8_t zeros[3] = {0, 0, 0};
+  framWriteBytes(FRAM_MAGIC_OFFSET, zeros, 3);
+
+  Serial.println("FRAM cleared (magic + configured)");
+  espSerial.println("{\"type\":\"configClearOk\"}");
+  espSerial.flush();
+}
+
+// ===================== RS485 Functions =====================
+
 void rs485Transmit() {
   digitalWrite(RS485_DE_PIN, HIGH);
   digitalWrite(RS485_RE_PIN, HIGH);
@@ -86,14 +302,15 @@ void rs485Receive() {
   digitalWrite(RS485_RE_PIN, LOW);
 }
 
-void sendMotorCommand(const char *direction, const char *speed) {
+void sendMotorCommand(const char *direction) {
   JsonDocument doc;
   doc["cmd"] = "motor";
   JsonArray addr = doc["addr"].to<JsonArray>();
-  // Send command to ALL pins (0..TOTAL_PINS-1)
   for (int i = 0; i < TOTAL_PINS; i++) addr.add(i);
   doc["dir"] = direction;
-  //doc["spd"] = speed;
+  if (strcmp(direction, "down") == 0) {
+    doc["revs"] = MOTOR_DOWN_REVS;
+  }
 
   rs485Transmit();
   serializeJson(doc, RS485);
@@ -102,14 +319,15 @@ void sendMotorCommand(const char *direction, const char *speed) {
   rs485Receive();
 }
 
-void sendMotorCommandRemaining(const char *direction, const char *speed) {
+void sendMotorCommandRemaining(const char *direction) {
   JsonDocument doc;
   doc["cmd"] = "motor";
   JsonArray addr = doc["addr"].to<JsonArray>();
-  // Send command ONLY to remaining (non-fallen) pins
   for (int i = 0; i < remainingCount; i++) addr.add(remainingPins[i]);
   doc["dir"] = direction;
-  //doc["spd"] = speed;
+  if (strcmp(direction, "down") == 0) {
+    doc["revs"] = MOTOR_DOWN_REVS;
+  }
 
   rs485Transmit();
   serializeJson(doc, RS485);
@@ -128,6 +346,7 @@ void sendStatusReq() {
   rs485Receive();
 }
 
+
 // Send ball detection data to ESP
 void sendBallDetectedToESP() {
   JsonDocument doc;
@@ -135,26 +354,23 @@ void sendBallDetectedToESP() {
   
   JsonArray fallen = doc["fallenPins"].to<JsonArray>();
   for (int i = 0; i < fallenCount; i++) {
-    fallen.add(fallenPins[i] + 1); // Convert 0-9 to 1-10 for pin numbers
+    fallen.add(fallenPins[i] + 1); // Convert 0-based to 1-based pin numbers
   }
   
   JsonArray remaining = doc["remainingPins"].to<JsonArray>();
   for (int i = 0; i < remainingCount; i++) {
-    remaining.add(remainingPins[i] + 1); // Convert 0-9 to 1-10 for pin numbers
+    remaining.add(remainingPins[i] + 1);
   }
   
-  // Calculate strike/spare
   bool isStrike = (fallenCount == TOTAL_PINS);
   bool isSpare = (fallenCount == TOTAL_PINS && remainingCount == 0);
   doc["isStrike"] = isStrike;
   doc["isSpare"] = isSpare;
 
-  // Send JSON to ESP over dedicated serial link
   serializeJson(doc, espSerial);
   espSerial.println();
   espSerial.flush();
 
-  // Also log the exact JSON to the PC Serial monitor
   Serial.print("RP -> ESP : ");
   serializeJson(doc, Serial);
   Serial.println();
@@ -166,13 +382,13 @@ void sendBallDetectedToESP() {
   Serial.println(remainingCount);
 }
 
-// Handle commands from ESP
+// ===================== ESP Command Handler =====================
+
 void handleESPCommand(const char *line) {
   if (!line) return;
   while (*line == ' ' || *line == '\t') line++;
   if (*line == '\0') return;
 
-  // Log raw command from ESP (this will also be visible on ESP side)
   Serial.print("📥 Command from ESP: ");
   Serial.println(line);
   
@@ -187,58 +403,113 @@ void handleESPCommand(const char *line) {
   }
   
   const char *cmd = doc["cmd"] | "";
+
+  // ---- Config commands (FRAM) ----
+  if (strcmp(cmd, "configRead") == 0) {
+    handleConfigRead();
+    return;
+  }
+  if (strcmp(cmd, "configWrite") == 0) {
+    handleConfigWrite(doc);
+    return;
+  }
+  if (strcmp(cmd, "configClear") == 0) {
+    handleConfigClear();
+    return;
+  }
+
+  // ---- Game commands ----
   if (strcmp(cmd, "gameStart") == 0) {
-    Serial.println("🎮 Game start command from ESP - sending forward to all slaves");
-    // Reset all pins to standing
+    Serial.println("🎮 Game start — probing all slaves (status_req); motion after all reply");
     for (int i = 0; i < TOTAL_PINS; i++) {
       pinStates[i] = true;
     }
-    // Cancel any in-progress ball detection wait from a previous game
+    ballsSinceLastFullRack = 0;
+    gameOver = false;
     ballJustDetected = false;
     cancelBallWait = true;
-    // Send forward command to all slaves
+    pendingGameStart = true;
     currentState = STATE_FORWARD;
-    waitingToSendStatus = false;
+    waitingForStatus = false;
     statusCount = 0;
-    for (int i = 0; i < 4; i++) slaveReplied[i] = false;
-    // Trigger immediate forward command
-    sendMotorCommand("up", "slow");
-    currentState = STATE_HOLD;
-    waitingToSendStatus = true;
-    waitStartTime = millis();
-  } else if (strcmp(cmd, "playerChange") == 0) {
-    Serial.println("👤 Player change command from ESP - sending forward to all slaves");
-    // Reset all pins to standing for new player
-    for (int i = 0; i < TOTAL_PINS; i++) {
-      pinStates[i] = true;
-    }
-    // Send forward command to all slaves
-    currentState = STATE_FORWARD;
-    waitingToSendStatus = false;
-    statusCount = 0;
-    for (int i = 0; i < 4; i++) slaveReplied[i] = false;
-    // Trigger immediate forward command
-    sendMotorCommand("up", "slow");
-    currentState = STATE_HOLD;
-    waitingToSendStatus = true;
-    waitStartTime = millis();
+    for (int i = 0; i < TOTAL_PINS; i++) slaveReplied[i] = false;
+    sendStatusReq();
+    waitingForStatus = true;
   } else if (strcmp(cmd, "reset") == 0) {
     Serial.println("🔄 Reset command from ESP");
-    // Reset everything
+    pendingGameStart = false;
     for (int i = 0; i < TOTAL_PINS; i++) {
       pinStates[i] = true;
     }
-    // Cancel any in-progress ball detection wait
+    ballsSinceLastFullRack = 0;
+    gameOver = false;
     ballJustDetected = false;
     cancelBallWait = true;
     currentState = STATE_FORWARD;
-    waitingToSendStatus = false;
+    waitingForStatus = false;
     statusCount = 0;
-    for (int i = 0; i < 4; i++) slaveReplied[i] = false;
+    for (int i = 0; i < TOTAL_PINS; i++) slaveReplied[i] = false;
+  } else if (strcmp(cmd, "gameOver") == 0) {
+    Serial.println("🏁 Game over command from ESP - dropping all pins and entering FREE state");
+    pendingGameStart = false;
+    gameOver = true;
+    ballJustDetected = false;
+    cancelBallWait = false;
+    ballsSinceLastFullRack = 0;
+
+    for (int i = 0; i < TOTAL_PINS; i++) {
+      pinStates[i] = true;
+      remainingPins[i] = i;
+    }
+    remainingCount = TOTAL_PINS;
+    fallenCount = 0;
+
+    Serial.println(">>> GAME OVER: Sending all pins DOWN");
+    sendMotorCommandRemaining("down");
+    delay(1000);
+    Serial.println(">>> GAME OVER: Sending all pins FREE");
+    sendMotorCommandRemaining("free");
+    currentState = STATE_FREE;
+    waitingForStatus = false;
+    statusCount = 0;
+    for (int i = 0; i < TOTAL_PINS; i++) slaveReplied[i] = false;
   }
 }
 
-// Poll ESP serial link for commands from ESP
+// USB Serial (monitor): type `down` + Enter → send DOWN to all pin addresses.
+static const size_t SERIAL_CMD_MAX = 64;
+static char serialMonitorLine[SERIAL_CMD_MAX];
+static size_t serialMonitorLineLen = 0;
+
+void pollSerialMonitor() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      serialMonitorLine[serialMonitorLineLen] = '\0';
+      char *s = serialMonitorLine;
+      while (*s == ' ' || *s == '\t') s++;
+      char *end = s + strlen(s);
+      while (end > s && (end[-1] == ' ' || end[-1] == '\t')) {
+        *--end = '\0';
+      }
+      if (strcmp(s, "down") == 0) {
+        Serial.println(">>> Serial: DOWN to all pins");
+        sendMotorCommand("down");
+      }
+      serialMonitorLineLen = 0;
+      continue;
+    }
+    if (serialMonitorLineLen < SERIAL_CMD_MAX - 1) {
+      serialMonitorLine[serialMonitorLineLen++] = c;
+    } else {
+      serialMonitorLineLen = 0;
+    }
+  }
+}
+
+// Poll ESP serial link (JSON lines)
+
 void pollESPSerial() {
   while (espSerial.available()) {
     char c = (char)espSerial.read();
@@ -252,35 +523,48 @@ void pollESPSerial() {
     if (espSerialLineLen < SERIAL_LINE_MAX - 1) {
       espSerialLine[espSerialLineLen++] = c;
     } else {
-      // Line too long; reset
       espSerialLineLen = 0;
     }
   }
 }
 
-// ================= Setup =================
+// ===================== Setup =====================
+
 void setup() {
   pinMode(RS485_DE_PIN, OUTPUT);
   pinMode(RS485_RE_PIN, OUTPUT);
   rs485Receive();
 
-  // Configure ball sensor input.
-  // If your sensor is open-collector to ground with a pull-up resistor, use INPUT.
-  // If you wired it directly between pin and ground, and want to use internal pull-up,
-  // change this to INPUT_PULLUP and invert the logic in loop() if needed.
   pinMode(BALL_SENSOR_PIN, INPUT_PULLUP);
 
   RS485.begin(BAUDRATE);
   Serial.begin(115200);
   espSerial.begin(ESP_BAUD);
 
-  // Initialize all pins as standing at start
+  // Drive FRAM Write Protect pin LOW to allow writes
+  pinMode(FRAM_WP_PIN, OUTPUT);
+  digitalWrite(FRAM_WP_PIN, LOW);
+
+  // Initialize I2C for FRAM
+  Wire.setSDA(I2C_SDA_PIN);
+  Wire.setSCL(I2C_SCL_PIN);
+  Wire.begin();
+  delay(10); // let I2C bus settle
+  framAvailable = framDetect();
+  if (framAvailable) {
+    Serial.println("✅ FRAM detected at 0x50");
+  } else {
+    Serial.println("⚠️ FRAM not detected at 0x50 — config storage unavailable");
+    Serial.println("   Check: SDA/SCL wiring, 4.7K pull-ups, A0/A1/A2 tied to GND, VDD=3.3V");
+  }
+
   for (int i = 0; i < TOTAL_PINS; i++) {
     pinStates[i] = true;
   }
 
   delay(2000);
   Serial.println("=== Host Started: Non-Blocking Mode ===");
+  Serial.println("Serial: type \"down\" + Enter to lower all pins");
   Serial.print("ESP link: RX=");
   Serial.print(ESP_RX_PIN);
   Serial.print(" TX=");
@@ -288,21 +572,23 @@ void setup() {
   Serial.print(" @ ");
   Serial.print(ESP_BAUD);
   Serial.println(" baud");
+  Serial.print("FRAM: ");
+  Serial.println(framAvailable ? "OK" : "NOT FOUND");
 
-  // Start Sequence
   Serial.println(">>> Initializing: ...");
-
-  // Set timer to send Status Request after initial interval
-  waitingToSendStatus = true;
-  waitStartTime = millis();
+  sendStatusReq();
+  waitingForStatus = true;
 }
 
-// ================= Main Loop =================
+// ===================== Main Loop =====================
+
 void loop() {
-  // 0. ALWAYS CHECK FOR COMMANDS FROM ESP (Non-blocking)
+  // 0. USB serial (manual commands)
+  pollSerialMonitor();
+  // 1. ESP serial (JSON)
   pollESPSerial();
-  
-  // 1. ALWAYS LISTEN (Non-blocking)
+
+  // 2. RS485 replies (non-blocking)
   if (RS485.available()) {
     String raw = RS485.readStringUntil('\n');
     int start = raw.indexOf('{');
@@ -313,18 +599,14 @@ void loop() {
       DeserializationError err = deserializeJson(doc, json);
 
       if (!err) {
-        // Handle Status Response
         if (doc["cmd"] == "status_res") {
           int addr = doc["addr"];
 
-          // Only count if this slave hasn't been counted yet this cycle
           if (addr >= 0 && addr < TOTAL_PINS && !slaveReplied[addr]) {
             slaveReplied[addr] = true;
             statusCount++;
 
-            // Track & latch pin state for this slave (0–3).
-            // Once a pin becomes false (fallen), it stays false.
-            bool pin = doc["pin"] | true;  // default true if missing
+            bool pin = doc["pin"] | true;
             if (addr >= 0 && addr < TOTAL_PINS) {
               pinStates[addr] = pinStates[addr] && pin;
             }
@@ -337,38 +619,28 @@ void loop() {
             Serial.println(pinStates[addr]);
           }
         }
-        // Handle Alerts IMMEDIATELY (Example)
-        else if (doc["cmd"] == "alert") {
-          Serial.println("!!! ALERT RECEIVED !!!");
-          delay(1500);
-          currentState = STATE_FORWARD;
-          waitingToSendStatus = false;
-          statusCount = TOTAL_PINS;
-
-          // You can handle emergency stop here immediately
-        }
+        
         delay(100);
       }
     }
   }
 
-  // 2. CHECK IF WAITING PERIOD IS OVER
-  if (waitingToSendStatus == true) {
-    if (millis() - waitStartTime >= interval) {
-      // Time is up! Send the Status Request now
-      Serial.println(">>> Timer Done. Requesting Status...");
-      sendStatusReq();
-
-      waitingToSendStatus = false; // Stop waiting
-    }
-  }
-
   // 3. CHECK IF ALL SLAVES REPLIED
-  // Only check this if we are NOT currently waiting on the timer
-  if (!waitingToSendStatus && statusCount >= TOTAL_PINS) {
+  if (waitingForStatus && statusCount >= TOTAL_PINS) {
+    if (pendingGameStart) {
+      Serial.println("✅ Game start: all slaves online — sending UP");
+      pendingGameStart = false;
+      sendMotorCommand("up");
+      currentState = STATE_HOLD;
+      statusCount = 0;
+      for (int i = 0; i < TOTAL_PINS; i++) slaveReplied[i] = false;
+      sendStatusReq();
+      waitingForStatus = true;
+      return;
+    }
+
     Serial.println(">>> All slaves replied. Switching State...");
 
-    // Build remainingPins and fallenPins arrays from latest pinStates
     remainingCount = 0;
     fallenCount = 0;
     for (int i = 0; i < TOTAL_PINS; i++) {
@@ -379,14 +651,23 @@ void loop() {
       }
     }
 
-    // If a ball was just detected, send the current pins to ESP now
     if (ballJustDetected) {
       Serial.println("🎳 Ball cycle complete - sending pins to ESP");
       sendBallDetectedToESP();
       ballJustDetected = false;
+
+      bool allPinsDown = (remainingCount == 0);
+      ballsSinceLastFullRack++;
+
+      if (allPinsDown || ballsSinceLastFullRack >= 3) {
+        Serial.println("🎯 Scheduling full rack on next cycle");
+        for (int i = 0; i < TOTAL_PINS; i++) {
+          pinStates[i] = true;
+        }
+        ballsSinceLastFullRack = 0;
+      }
     }
 
-    // Reset counters for next round
     statusCount = 0;
     for (int i = 0; i < TOTAL_PINS; i++) slaveReplied[i] = false;
 
@@ -394,92 +675,86 @@ void loop() {
     if (currentState == STATE_FORWARD) {
       delay(500);
       Serial.println(">>> Sending: UP");
-      sendMotorCommand("up", "slow");
+      sendMotorCommand("up");
       currentState = STATE_HOLD;
     } else if (currentState == STATE_HOLD) {
       delay(50);
       Serial.println(">>> Sending: HOLD");
-      sendMotorCommand("stop", "slow");
+      sendMotorCommand("stop");
       currentState = STATE_REVERSE;
     } else if (currentState == STATE_REVERSE) {
-  delay(1000);
+      delay(1000);
 
-  // ===== PRINT REMAINING & FALLEN PINS BEFORE MOTOR COMMAND =====
-  Serial.println("----- PIN STATUS BEFORE REVERSE -----");
+      Serial.println("----- PIN STATUS BEFORE REVERSE -----");
+      Serial.print("Remaining Pins (Standing): ");
+      for (int i = 0; i < remainingCount; i++) {
+        Serial.print(remainingPins[i]);
+        Serial.print(" ");
+      }
+      Serial.println();
+      Serial.print("Fallen Pins: ");
+      for (int i = 0; i < fallenCount; i++) {
+        Serial.print(fallenPins[i]);
+        Serial.print(" ");
+      }
+      Serial.println();
+      Serial.println("--------------------------------------");
 
-  Serial.print("Remaining Pins (Standing): ");
-  for (int i = 0; i < remainingCount; i++) {
-    Serial.print(remainingPins[i]);
-    Serial.print(" ");
-  }
-  Serial.println();
-
-  Serial.print("Fallen Pins: ");
-  for (int i = 0; i < fallenCount; i++) {
-    Serial.print(fallenPins[i]);
-    Serial.print(" ");
-  }
-  Serial.println();
-  Serial.println("--------------------------------------");
-
-  // ===== SEND MOTOR COMMAND =====
-  Serial.println(">>> Sending: REVERSE");
-  sendMotorCommandRemaining("down", "slow");
-
-  currentState = STATE_FREE;
-    } else if (currentState == STATE_FREE) {
-      Serial.println(">>> Sending: FREE");
-      // Only remaining (non-fallen) pins get FREE command
-      sendMotorCommandRemaining("free", "slow");
-
-      // Keep pins/motor in FREE until the ball is detected.
-      Serial.println("Waiting for ball...");
-      // Assumed logic: sensor 1 = no ball, 0 = ball detected.
-      // Non-blocking wait for ball detection
-      bool ballDetected = false;
-      unsigned long ballWaitStart = millis();
-      const unsigned long BALL_TIMEOUT = 60000; // 60 second timeout
-      
-      while (!ballDetected && (millis() - ballWaitStart < BALL_TIMEOUT)) {
-        // Check for ESP commands while waiting (e.g. new game/reset)
-        pollESPSerial();
-
-        // If a new game / reset was requested, cancel this ball wait immediately
-        if (cancelBallWait) {
-          Serial.println("🔄 Game/reset received while waiting for ball - cancelling wait");
-          cancelBallWait = false;
-          ballDetected = false;
-          break;
-        }
-        
-        // Check ball sensor
-        if (digitalRead(BALL_SENSOR_PIN) == LOW) {
-          ballDetected = true;
-          break;
-        }
-        delay(20); // small delay to avoid tight busy-wait
+      // No standing pins (e.g. strike): remaining list is empty, but every pin
+      // still ran UP and must receive DOWN/FREE to complete the rack cycle.
+      Serial.println(">>> Sending: REVERSE");
+      if (remainingCount == 0) {
+        Serial.println("   (all pins down — full-rack down to all addresses)");
+        sendMotorCommand("down");
+      } else {
+        sendMotorCommandRemaining("down");
       }
 
-      if (ballDetected) {
-        // Ball detected, now wait 2 seconds before switching state.
-        Serial.println("Ball detected, waiting 2 seconds...");
-        delay(2000);
-
-        // Mark that we need to send pins to ESP after next status cycle
-        ballJustDetected = true;
-        currentState = STATE_FORWARD;
+      currentState = STATE_FREE;
+    } else if (currentState == STATE_FREE) {
+      if (gameOver) {
+        Serial.println("🏁 Game over - lane is FREE and idle");
       } else {
-        Serial.println("⚠️ Ball not detected (timeout/cancel) - resetting to forward");
-        ballJustDetected = false;
-        currentState = STATE_FORWARD;
+        Serial.println(">>> Sending: FREE");
+        if (remainingCount == 0) {
+          sendMotorCommand("free");
+        } else {
+          sendMotorCommandRemaining("free");
+        }
+
+        Serial.println("Waiting for ball...");
+        bool ballDetected = false;
+        
+        while (!ballDetected) {
+          pollSerialMonitor();
+          pollESPSerial();
+
+          if (cancelBallWait) {
+            Serial.println("🔄 Game/reset received while waiting for ball - cancelling wait");
+            cancelBallWait = false;
+            break;
+          }
+          
+          if (digitalRead(BALL_SENSOR_PIN) == LOW) {
+            ballDetected = true;
+            break;
+          }
+        }
+
+        if (ballDetected) {
+          Serial.println("Ball detected, waiting 2 seconds...");
+          delay(2000);
+          ballJustDetected = true;
+          currentState = STATE_FORWARD;
+        } else {
+          Serial.println("🔄 Ball wait cancelled due to game/reset - resetting to forward");
+          ballJustDetected = false;
+          currentState = STATE_FORWARD;
+        }
       }
     }
 
-    // Start the Non-Blocking Timer again
-    // We just sent a motor command, so we wait before asking for status
-    waitingToSendStatus = true;
-    waitStartTime = millis();
+    sendStatusReq();
+    waitingForStatus = true;
   }
 }
-
-

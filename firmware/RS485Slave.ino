@@ -43,7 +43,7 @@
 #define DIR_DOWN  LOW
 
 #define HOMING_ENCODER_THRESHOLD 400
-#define RECOVERY_REVS            8
+#define DEFAULT_DOWN_REVS        8   // used if master omits "revs" (legacy)
 // Operation Parameters
 
 #define BOTTLE_KICK_THRESHOLD -200   // Negative encoder value to trigger check
@@ -83,12 +83,22 @@ long tempCounter = 0;
 int addr = -1;
 
 String motorDir = "stop";
+int    downRevsFromMaster = DEFAULT_DOWN_REVS;
 bool waitingForStatus = false;  //when master send req then it become true.
 
 bool pinState = true;  //detect bottle: true-> bottle stand. false-> bottle fall.
 
 unsigned long motionStartTime = 0;
-const unsigned long TIMEOUT_MS = 20000;       // <--- MODIFIED: 20 Seconds Limit
+const unsigned long TIMEOUT_MS = 20000;
+
+// ---- Self-recovery after stuck detection ----
+// Phases: 1=hold(.5s) 2=down 3=free(.5s) 4=up(retry) 5=settle(1s) 6=final_down
+bool inRecovery        = false;
+int  recoveryPhase     = 0;
+int  recoveryAttempt   = 0;
+const int MAX_RECOVERY = 3;
+unsigned long recoveryTimer = 0;
+int  recoveryDownTarget = 0;  // how many revs to go DOWN (= how many UP did)
 
 
 /* =====================================================
@@ -251,10 +261,17 @@ void loop() {
 
       for (int i = 0; i < addrArr.size(); i++) {
         if (addrArr[i] == MY_ADDR) {
+          // Abort any ongoing recovery — master takes priority
+          inRecovery      = false;
+          recoveryPhase   = 0;
+          recoveryAttempt = 0;
+
           motorDir  = dir;
 
           if (motorDir == "down") {
             digitalWrite(EN_PIN, LOW);
+            downRevsFromMaster = (int)(doc["revs"] | DEFAULT_DOWN_REVS);
+            if (downRevsFromMaster < 1) downRevsFromMaster = DEFAULT_DOWN_REVS;
             currentState = STATE_DOWN;
             resetEncoder();
           } 
@@ -293,17 +310,11 @@ void loop() {
        addr = doc["addr"];
     }
 
-    //-----Alert Command-----
-    else if (doc["cmd"] == "alert") {
-      //motorStop();
-      currentState = STATE_HOLD;
-      digitalWrite(EN_PIN, LOW);
-      Serial.println("----ALERT RX----");
-    }
+    
   }
 
-  // Handle Status Response Logic
-  if (waitingForStatus == true && moveActive == false) {
+  // Handle Status Response Logic (skip during recovery — slave is busy)
+  if (waitingForStatus == true && moveActive == false && !inRecovery) {
     if (MY_ADDR == 0) {
       delay(60);
       sendStatus(); 
@@ -321,47 +332,54 @@ void loop() {
   unsigned long motionElapsed = (motionStartTime > 0) ? millis() - motionStartTime : 0;
 
   if (motionStartTime > 0 && motionElapsed > TIMEOUT_MS) {
-    Serial.println("⏱ 15s Timeout Reached → STOP");
+    Serial.println("⏱ 20s Timeout Reached → STOP");
     alert = 2;
     currentState = STATE_HOLD;
-    //motorStop(); // This stops motor AND resets motionStartTime to 0
+    if (inRecovery) {
+      inRecovery      = false;
+      recoveryPhase   = 0;
+      recoveryAttempt = 0;
+      sendAlert();
+    }
   }
 
   //---------------------------------------------------------------------------------
-  switch (currentState) {
+  // Recovery takes priority over normal state machine
+  if (inRecovery) {
+    handleRecovery();
+  } else {
+    switch (currentState) {
 
-    case STATE_UP:                    // Moving UP
-      movingUP();
-      break;
-
-    case STATE_DOWN:                  // Moving Down
-      movingDOWN();
-      break;
-
-    case STATE_FREE:                  // Motor become free
-      digitalWrite(EN_PIN, HIGH);
-      moveActive = false;
-      motionStartTime = 0;
-
-      if (alert)
+      case STATE_UP:                    // Moving UP
+        movingUP();
         break;
 
-    case STATE_MONITOR_KICK:         //called after bottle kept down
-          // A. Check for Kick (Negative Threshold)
-      if (encoderCount < BOTTLE_KICK_THRESHOLD) {
-        Serial.print("[STATE 3] Kick Detected at: ");
-        Serial.println(encoderCount);
-        tempCounter = encoderCount; 
-        pinState = false;
-        resetEncoder();
-        break; // Exit switch immediately
-      }
+      case STATE_DOWN:                  // Moving Down
+        movingDOWN();
+        break;
 
-    case STATE_HOLD:
-      digitalWrite(EN_PIN, LOW);
-      motionStartTime = 0;
-      moveActive = false;
-      break;
+      case STATE_FREE:                  // Motor become free
+        digitalWrite(EN_PIN, HIGH);
+        moveActive = false;
+        motionStartTime = 0;
+
+      case STATE_MONITOR_KICK:         //called after bottle kept down
+            // A. Check for Kick (Negative Threshold)
+        if (encoderCount < BOTTLE_KICK_THRESHOLD) {
+          Serial.print("[STATE 3] Kick Detected at: ");
+          Serial.println(encoderCount);
+          tempCounter = encoderCount; 
+          pinState = false;
+          resetEncoder();
+          break; // Exit switch immediately
+        }
+
+      case STATE_HOLD:
+        digitalWrite(EN_PIN, LOW);
+        motionStartTime = 0;
+        moveActive = false;
+        break;
+    }
   }
 }
 
@@ -398,12 +416,30 @@ void movingUP() {
     Serial.print(" | Encoder Δ = ");
     Serial.println(encoderCount);
 
-    // ---- STUCK DETECTED ----
+    // ---- STUCK DETECTED → enter self-recovery ----
     if (encoderCount < HOMING_ENCODER_THRESHOLD) {
-      Serial.println("Homing Stuck → Recovery Down");
       moveActive = false;
-      currentState = STATE_HOLD;
-      sendAlert();
+      recoveryDownTarget = revCounter;  // go back down the same distance
+      recoveryAttempt++;
+
+      if (recoveryAttempt > MAX_RECOVERY) {
+        Serial.println("Stuck → 3 retries exhausted → sending alert");
+        alert = 1;
+        sendAlert();
+        currentState = STATE_HOLD;
+        inRecovery      = false;
+        recoveryPhase   = 0;
+        recoveryAttempt = 0;
+      } else {
+        Serial.print("Stuck → recovery attempt ");
+        Serial.print(recoveryAttempt);
+        Serial.print("/");
+        Serial.println(MAX_RECOVERY);
+        inRecovery    = true;
+        recoveryPhase = 1;
+        recoveryTimer = millis();
+        motionStartTime = 0;
+      }
     }
     resetEncoder();
   }
@@ -425,12 +461,155 @@ void movingDOWN() {
   }
 
   // FAST DOWN (low delay = fast)
-  if (moveStep(RECOVERY_REVS, 120)) {
+  if (moveStep(downRevsFromMaster, 120)) {
     Serial.println("Recovery Done → Retry Homing");
     started = false;
     resetEncoder();
     currentState = STATE_HOLD;
     //currentState = STATE_UP;
+  }
+}
+
+// =================================================
+// =============== STUCK SELF-RECOVERY ===============
+// Phases: 1=hold(.5s) → 2=down(till encoder≈0) → 3=free(.5s)
+//         → 4=up(retry) → 5=settle(1s) → 6=down(till encoder≈0) → FREE
+// =================================================
+
+void handleRecovery() {
+  unsigned long elapsed = millis() - recoveryTimer;
+
+  switch (recoveryPhase) {
+
+    // Phase 1: Hold for 0.5 s — let things settle
+    case 1:
+      digitalWrite(EN_PIN, LOW);
+      moveActive = false;
+      if (elapsed >= 500) {
+        Serial.println("[Recovery] → Phase 2: DOWN");
+        recoveryPhase = 2;
+        resetEncoder();
+        startMove(DIR_DOWN);
+      }
+      break;
+
+    // Phase 2: Move down same number of revs as the UP that got stuck
+    case 2: {
+      int target = recoveryDownTarget > 0 ? recoveryDownTarget : 1;
+      stepMotor(120);
+      if (stepCounter >= (long)STEPS_PER_REV * MICROSTEPS) {
+        stepCounter = 0;
+        revCounter++;
+        Serial.print("[Recovery] Down Rev ");
+        Serial.print(revCounter);
+        Serial.print("/");
+        Serial.println(target);
+      }
+      if (revCounter >= target) {
+        Serial.println("[Recovery] → Phase 3: FREE (back to start)");
+        moveActive = false;
+        recoveryPhase = 3;
+        recoveryTimer = millis();
+        digitalWrite(EN_PIN, HIGH);
+      }
+      break;
+    }
+
+    // Phase 3: Free for 0.5 s
+    case 3:
+      digitalWrite(EN_PIN, HIGH);
+      if (elapsed >= 500) {
+        Serial.print("[Recovery] → Phase 4: UP retry (attempt ");
+        Serial.print(recoveryAttempt);
+        Serial.println(")");
+        recoveryPhase = 4;
+        resetEncoder();
+        digitalWrite(EN_PIN, LOW);
+        startMove(DIR_UP);
+      }
+      break;
+
+    // Phase 4: Move UP (retry) — same stuck check as movingUP()
+    case 4:
+      if (digitalRead(SW1) == HIGH) {
+        Serial.println("[Recovery] UP success → Phase 5: SETTLE");
+        alert = 0;
+        pinState = true;
+        moveActive = false;
+        recoveryDownTarget = revCounter;  // save for phase 6 final down
+        recoveryPhase = 5;
+        recoveryTimer = millis();
+        break;
+      }
+      if (!moveActive) {
+        startMove(DIR_UP);
+      }
+      stepMotor(150);
+      if (stepCounter >= (long)STEPS_PER_REV * MICROSTEPS) {
+        stepCounter = 0;
+        revCounter++;
+        if (encoderCount < HOMING_ENCODER_THRESHOLD) {
+          // Still stuck
+          moveActive = false;
+          recoveryDownTarget = revCounter;  // save for next phase 2 down
+          recoveryAttempt++;
+          if (recoveryAttempt > MAX_RECOVERY) {
+            Serial.println("[Recovery] FAILED after 3 attempts → alert");
+            alert = 1;
+            sendAlert();
+            inRecovery      = false;
+            recoveryPhase   = 0;
+            recoveryAttempt = 0;
+            currentState    = STATE_HOLD;
+          } else {
+            Serial.print("[Recovery] Still stuck → restart (attempt ");
+            Serial.print(recoveryAttempt);
+            Serial.println(")");
+            recoveryPhase = 1;
+            recoveryTimer = millis();
+            motionStartTime = 0;
+          }
+        }
+        resetEncoder();
+      }
+      break;
+
+    // Phase 5: Settle — hold for 1 s after successful UP
+    case 5:
+      digitalWrite(EN_PIN, LOW);
+      if (elapsed >= 1000) {
+        Serial.println("[Recovery] → Phase 6: FINAL DOWN");
+        recoveryPhase = 6;
+        resetEncoder();
+        startMove(DIR_DOWN);
+      }
+      break;
+
+    // Phase 6: Final down same revs as the UP, then FREE
+    case 6: {
+      int target = recoveryDownTarget > 0 ? recoveryDownTarget : 1;
+      stepMotor(120);
+      if (stepCounter >= (long)STEPS_PER_REV * MICROSTEPS) {
+        stepCounter = 0;
+        revCounter++;
+        Serial.print("[Recovery] Final Down Rev ");
+        Serial.print(revCounter);
+        Serial.print("/");
+        Serial.println(target);
+      }
+      if (revCounter >= target) {
+        Serial.println("[Recovery] DONE — entering FREE");
+        moveActive      = false;
+        inRecovery      = false;
+        recoveryPhase   = 0;
+        recoveryAttempt = 0;
+        motionStartTime = 0;
+        currentState    = STATE_FREE;
+        digitalWrite(EN_PIN, HIGH);
+        resetEncoder();
+      }
+      break;
+    }
   }
 }
 

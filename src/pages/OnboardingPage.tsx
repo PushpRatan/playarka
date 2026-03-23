@@ -1,15 +1,17 @@
-import { useState, useEffect } from 'react';
-import mqtt, { type MqttClient } from 'mqtt';
+import { useState, useEffect } from "react";
+import mqtt, { type MqttClient } from "mqtt";
 
-const MQTT_BROKER = 'wss://g11e070b.ala.asia-southeast1.emqxsl.com:8084/mqtt';
-const MQTT_USERNAME = 'Pushp';
-const MQTT_PASSWORD = 'Pushp9029@r';
-const DEVICE_ID = '1';
-const STATE_TOPIC = `playarka/device/${DEVICE_ID}/state`;
+const MQTT_BROKER = "wss://g11e070b.ala.asia-southeast1.emqxsl.com:8084/mqtt";
+const MQTT_USERNAME = "Pushp";
+const MQTT_PASSWORD = "Pushp9029@r";
+
+function getDeviceIdFromUrl(): string {
+  return new URLSearchParams(window.location.search).get("device") || "1";
+}
 
 export function OnboardingPage() {
   const [players, setPlayers] = useState<string[]>([]);
-  const [playerName, setPlayerName] = useState('');
+  const [playerName, setPlayerName] = useState("");
   const [ready, setReady] = useState(false);
   const [paymentQr, setPaymentQr] = useState<string | null>(null);
   const [paymentStatus, setPaymentStatus] = useState<string | null>(null);
@@ -17,13 +19,12 @@ export function OnboardingPage() {
   const [mqttClient, setMqttClient] = useState<MqttClient | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
-  useEffect(() => {
-    // Get device ID from URL
-    const urlParams = new URLSearchParams(window.location.search);
-    const deviceId = urlParams.get('device') || DEVICE_ID;
+  const deviceId = getDeviceIdFromUrl();
+  const stateTopic = `playarka/device/${deviceId}/state`;
 
+  useEffect(() => {
     const options = {
-      clientId: `playarka_mobile_${Math.random().toString(16).substring(2, 8)}`,
+      clientId: `playarka_mobile_${deviceId}_${Math.random().toString(16).substring(2, 8)}`,
       clean: true,
       reconnectPeriod: 5000,
       connectTimeout: 10000,
@@ -34,21 +35,20 @@ export function OnboardingPage() {
     const client = mqtt.connect(MQTT_BROKER, options);
     setMqttClient(client);
 
-    client.on('connect', () => {
-      console.log('✅ Mobile MQTT Connected');
+    client.on("connect", () => {
+      console.log("✅ Mobile MQTT Connected");
       setIsConnected(true);
 
-      // Publish scan event
-      client.publish(STATE_TOPIC, JSON.stringify({ action: 'scan' }), { qos: 1 });
-
-      // Subscribe to state updates
-      client.subscribe(STATE_TOPIC, { qos: 1 });
+      client.publish(stateTopic, JSON.stringify({ action: "scan" }), {
+        qos: 1,
+      });
+      client.subscribe(stateTopic, { qos: 1 });
     });
 
-    client.on('message', (topic, message) => {
+    client.on("message", (_topic, message) => {
       try {
         const data = JSON.parse(message.toString());
-        if (data.action === 'update') {
+        if (data.action === "update") {
           setPlayers(data.players || []);
           setReady(data.ready || false);
           setPaymentQr(data.paymentQr || null);
@@ -56,7 +56,7 @@ export function OnboardingPage() {
           setAmount(data.amount || null);
         }
       } catch (error) {
-        console.error('Error parsing message:', error);
+        console.error("Error parsing message:", error);
       }
     });
 
@@ -65,40 +65,44 @@ export function OnboardingPage() {
         client.end();
       }
     };
-  }, []);
+  }, [deviceId, stateTopic]);
 
   const handleAddPlayer = () => {
     if (!playerName.trim() || !mqttClient || !mqttClient.connected) return;
 
     mqttClient.publish(
-      STATE_TOPIC,
-      JSON.stringify({ action: 'addPlayer', name: playerName.trim() }),
-      { qos: 1 }
+      stateTopic,
+      JSON.stringify({ action: "addPlayer", name: playerName.trim() }),
+      { qos: 1 },
     );
-    setPlayerName('');
+    setPlayerName("");
   };
 
   const handleReady = () => {
     if (!mqttClient || !mqttClient.connected) return;
-    mqttClient.publish(STATE_TOPIC, JSON.stringify({ action: 'ready' }), { qos: 1 });
+    mqttClient.publish(stateTopic, JSON.stringify({ action: "ready" }), {
+      qos: 1,
+    });
   };
 
   const handleRequestPayment = () => {
     if (!mqttClient || !mqttClient.connected) return;
     const calculatedAmount = players.length * 250; // ₹250 per player
     mqttClient.publish(
-      STATE_TOPIC,
-      JSON.stringify({ action: 'requestPayment', amount: calculatedAmount }),
-      { qos: 1 }
+      stateTopic,
+      JSON.stringify({ action: "requestPayment", amount: calculatedAmount }),
+      { qos: 1 },
     );
   };
 
-  if (paymentStatus === 'success') {
+  if (paymentStatus === "success") {
     return (
       <div className="min-h-screen wood-background flex items-center justify-center p-6">
         <div className="wood-panel border-2 border-green-500/50 rounded-lg p-8 text-center relative overflow-hidden max-w-md">
           <div className="text-6xl mb-4">✅</div>
-          <h2 className="text-2xl font-bold text-green-400 mb-2">Payment Successful!</h2>
+          <h2 className="text-2xl font-bold text-green-400 mb-2">
+            Payment Successful!
+          </h2>
           <p className="text-gray-400">Game will start on the main screen</p>
         </div>
       </div>
@@ -122,14 +126,17 @@ export function OnboardingPage() {
             <p className="text-center text-sm text-gray-400 mb-2">
               Click the QR code to simulate payment
             </p>
-            <div 
+            <div
               className="bg-black/40 border-2 border-gray-600/40 rounded p-4 text-center cursor-pointer hover:bg-black/50 transition-colors"
               onClick={() => {
                 if (mqttClient && mqttClient.connected) {
                   mqttClient.publish(
-                    STATE_TOPIC,
-                    JSON.stringify({ action: 'paymentStatus', status: 'success' }),
-                    { qos: 1 }
+                    stateTopic,
+                    JSON.stringify({
+                      action: "paymentStatus",
+                      status: "success",
+                    }),
+                    { qos: 1 },
                   );
                 }
               }}
@@ -138,7 +145,7 @@ export function OnboardingPage() {
               <p className="text-xs text-gray-300 break-all">{paymentQr}</p>
             </div>
           </div>
-          {paymentStatus === 'pending' && (
+          {paymentStatus === "pending" && (
             <div className="wood-panel border-2 border-yellow-500/50 rounded-lg p-4 text-center relative overflow-hidden">
               <p className="text-sm text-yellow-400">Waiting for payment...</p>
             </div>
@@ -156,11 +163,11 @@ export function OnboardingPage() {
           <div className="flex items-center gap-2">
             <div
               className={`w-2 h-2 rounded-full ${
-                isConnected ? 'bg-green-500' : 'bg-red-500'
+                isConnected ? "bg-green-500" : "bg-red-500"
               }`}
             />
             <span className="text-xs text-gray-400">
-              {isConnected ? 'Connected' : 'Connecting...'}
+              {isConnected ? "Connected" : "Connecting..."}
             </span>
           </div>
         </div>
@@ -175,7 +182,7 @@ export function OnboardingPage() {
               type="text"
               value={playerName}
               onChange={(e) => setPlayerName(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && handleAddPlayer()}
+              onKeyPress={(e) => e.key === "Enter" && handleAddPlayer()}
               placeholder="Enter player name"
               className="flex-1 bg-black/30 border-2 border-gray-600/40 rounded px-3 py-2 text-gray-300 placeholder-gray-500 focus:outline-none focus:border-gray-500/60"
             />
@@ -225,4 +232,3 @@ export function OnboardingPage() {
     </div>
   );
 }
-
